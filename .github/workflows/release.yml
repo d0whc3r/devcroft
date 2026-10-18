@@ -149,7 +149,10 @@ jobs:
       - name: Install build-system deps (apt)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev cmake ninja-build pkg-config
+          # fontconfig/freetype: yeslogic-fontconfig-sys needs fontconfig.pc
+          # at build time (build.rs of the font stack).
+          sudo apt-get install -y clang libclang-dev cmake ninja-build \
+            pkg-config libfontconfig1-dev libfreetype-dev
 
       # Slow (~1 min) but pinned; lands in ~/.cargo/bin, which mise/rustup
       # setups already have on PATH.

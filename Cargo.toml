@@ -8,6 +8,20 @@ description = "GPUI desktop workspace for agent harnesses with editor, terminal,
 repository = "https://github.com/hossainemruz/devcroft"
 readme = "README.md"
 
+[workspace]
+resolver = "2"
+members = ["."]
+
+# gpui-pre-apple's build script gates its Metal shader generation behind
+# `cfg!(target_os = "macos")`, which reflects the HOST (the CI runner), not
+# the cross-compilation TARGET. Cross-building darwin from Linux therefore
+# never ran the build script, and the crate failed with a missing
+# `stitched_shaders.metal`. This vendored copy (1:1 with crates.io 0.3.9)
+# switches the gate to CARGO_CFG_TARGET_OS. The runtime_shaders path is
+# pure-Rust (it just stitches .metal sources), so it works cross.
+[patch.crates-io]
+gpui-pre-apple = { path = "vendor-patches/gpui-pre-apple" }
+
 [features]
 default = ["gpui-fast"]
 # Switch the facade and native WebView together so they share GPUI types.
