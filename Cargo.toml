@@ -22,6 +22,9 @@ members = ["."]
 [patch.crates-io]
 gpui-pre-apple = { path = "vendor-patches/gpui-pre-apple" }
 
+# gpui-fast-apple has the same host-cfg build-script bug; see gpui-pre-apple note
+gpui-fast-apple = { path = "vendor-patches/gpui-fast-apple" }
+
 [features]
 default = ["gpui-fast"]
 # Switch the facade and native WebView together so they share GPUI types.
