@@ -143,6 +143,9 @@ RUN set -eux; \
 # inside the image; the real one is always built fresh at run time.
 # ---------------------------------------------------------------------------
 FROM toolchain AS deps-bake
+USER root
+RUN mkdir -p /target-warm && chown builder:builder /target-warm
+USER builder
 COPY --chown=builder:builder . /workspace
 WORKDIR /workspace
 ENV CARGO_TARGET_DIR=/target-warm \
