@@ -126,7 +126,8 @@ jobs:
             echo "error: no targets matched the filter (targets='$TARGETS')" >&2
             exit 1
           fi
-          echo "matrix=$selected" >> "$GITHUB_OUTPUT"
+          # strategy.matrix consumes {"include": [...]}, not a bare array.
+          echo "matrix=$(echo "$selected" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
 
   build:
     name: build ${{ matrix.asset }} (${{ matrix.triple }})
