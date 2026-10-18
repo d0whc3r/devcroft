@@ -24,7 +24,7 @@
 # NO secrets or credentials are baked; the image pulls/pushes are unauthenticated
 # on the public repo except for the GHCR push token in ci-image.yml.
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS toolchain
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -88,10 +88,10 @@ RUN set -eux; \
     zig version
 
 # cargo-zigbuild pinned exactly (release.yml: CARGO_ZIGBUILD_VERSION 0.23.4).
-# Keep the layer small: drop the extracted registry sources (the .crate cache
-# and index stay, so workspace builds re-extract locally, offline-capable).
-RUN cargo install --locked --version 0.23.4 cargo-zigbuild \
-    && rm -rf "${CARGO_HOME}/registry/src"
+# NOTE: do NOT purge ${CARGO_HOME}/registry/src — the extracted sources carry
+# the mtimes recorded in /target-warm's cargo fingerprints; re-extracting at
+# run time would produce fresh mtimes and invalidate the entire deps bake.
+RUN cargo install --locked --version 0.23.4 cargo-zigbuild
 
 # ---------------------------------------------------------------------------
 # Non-root builder: uid/gid 1001 deliberately matches the default user (uid
@@ -110,16 +110,7 @@ RUN useradd --create-home --uid 1001 --user-group --shell /bin/bash builder \
 USER builder
 WORKDIR /workspace
 
-# NOTE ON WARMTH: the baked CARGO_HOME holds the registry index + .crate cache
-# plus the preinstalled cargo-zigbuild binary. Workspace dependency compilation
-# always lands in <workspace>/target/ (not CARGO_HOME), so per-run compile time
-# is unaffected by this image except via warmed index metadata — workspace
-# target/ snapshots are intentionally NOT baked.
-LABEL org.opencontainers.image.source=https://github.com/d0whc3r/devcroft \
-      org.opencontainers.image.description="Warm CI build image for Devcroft: rust 1.97.1 (native x86_64-unknown-linux-gnu + aarch64-apple-darwin std), zig 0.16.0, cargo-zigbuild 0.23.4 on ubuntu 24.04" \
-      org.opencontainers.image.licenses=MIT
-
-# Final-layer gate: fail the image build on any pin drift. Docker treats a
+# Toolchain-layer gate: fail the image build on any pin drift. Docker treats a
 # nonzero exit from RUN as a build failure. Strings asserted exactly:
 #   rustc 1.97.1 / zig 0.16.0 / cargo-zigbuild 0.23.4 / both rust targets.
 RUN set -eux; \
@@ -129,3 +120,66 @@ RUN set -eux; \
     rustup target list --installed | grep -qx "aarch64-apple-darwin"; \
     rustup target list --installed | grep -qx "x86_64-unknown-linux-gnu"; \
     echo "ci image toolchain OK: rust 1.97.1 / zig 0.16.0 / cargo-zigbuild 0.23.4"
+
+# ---------------------------------------------------------------------------
+# Stage `deps-bake`: compile the ENTIRE locked dependency graph for both
+# matrix targets into a fixed absolute path /target-warm, which the final
+# stage copies in as its own layer.
+#
+# WHY THIS WORKS: cargo fingerprints reference absolute paths. The bake builds
+# with CARGO_TARGET_DIR=/target-warm and a source tree at /workspace — the
+# release flow (release.yml) mounts its checkout at that same /workspace and
+# sets the same CARGO_TARGET_DIR. Identical toolchain versions are asserted
+# above, `--locked` grantees the same resolution, and the linux-gnu target is
+# built with the same glibc suffix (.2.38) release.yml uses. As a result the
+# run-time `cargo zigbuild` validates (seconds) instead of recompiling (~15
+# min of dependency compiles). Only devcroft itself and any locally-changed
+# crates (vendored patches included) compile at run time.
+#
+# COLD COST: this stage re-runs whenever COPY . contents change (i.e. any
+# commit rebuilt after the image was last baked), like any cache miss — but
+# only when the ci-image workflow is triggered, not on release runs.
+# The final devcroft binary is deleted to avoid shipping a stale binary
+# inside the image; the real one is always built fresh at run time.
+# ---------------------------------------------------------------------------
+FROM toolchain AS deps-bake
+COPY --chown=builder:builder . /workspace
+WORKDIR /workspace
+ENV CARGO_TARGET_DIR=/target-warm \
+    ZIG_GLOBAL_CACHE_DIR=/home/builder/.cache/zig
+RUN set -eux; \
+    for t in x86_64-unknown-linux-gnu.2.38 aarch64-apple-darwin; do \
+      cargo zigbuild --release --locked --target "$t"; \
+    done; \
+    rm -f /target-warm/*/release/devcroft; \
+    du -sh /target-warm/*/release | head -4
+
+FROM toolchain
+COPY --from=deps-bake --chown=builder:builder /target-warm /target-warm
+ENV CARGO_TARGET_DIR=/target-warm
+
+# NOTE ON WARMTH: beyond tools, this image BAKES COMPILED DEPENDENCIES in
+# /target-warm: the full Cargo.lock dependency graph for both matrix targets,
+# prebuilt with the exact same absolute paths (source /workspace, output
+# /target-warm) and tool versions the release flow uses at run time. So the
+# run-time `cargo zigbuild` validates but does not recompile external deps —
+# only devcroft itself (plus any locally-changed crates) compile per run.
+# The tools-layer gate above re-asserts pins in this final stage too (same
+# filesystem), and the gate below also asserts the baked target dirs exist.
+# The SDK is still fetched per run, outside docker, and passed as SDKROOT.
+LABEL org.opencontainers.image.source=https://github.com/d0whc3r/devcroft \
+      org.opencontainers.image.description="Warm CI build image for Devcroft: rust 1.97.1 (native x86_64-unknown-linux-gnu + aarch64-apple-darwin std), zig 0.16.0, cargo-zigbuild 0.23.4, prebuilt deps for both targets on ubuntu 24.04" \
+      org.opencontainers.image.licenses=MIT
+
+# Final gate: pin drift would fail here (same strings as the toolchain
+# stage), and a missing baked dependency dir would fail loudly rather than
+# silently degrade every release job to a full cold compile.
+RUN set -eux; \
+    rustc --version | grep -q "^rustc 1.97.1 "; \
+    zig version | grep -qx "0.16.0"; \
+    cargo-zigbuild --version | grep -q "^cargo-zigbuild 0.23.4$"; \
+    rustup target list --installed | grep -qx "aarch64-apple-darwin"; \
+    rustup target list --installed | grep -qx "x86_64-unknown-linux-gnu"; \
+    test -d /target-warm/x86_64-unknown-linux-gnu/release/build; \
+    test -d /target-warm/aarch64-apple-darwin/release/build; \
+    echo "ci image OK: toolchain pins + baked deps for both targets"

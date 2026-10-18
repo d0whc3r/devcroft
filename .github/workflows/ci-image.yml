@@ -40,7 +40,10 @@ on:
     paths:
       - "Dockerfile.ci"
       - "mise.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
       - ".github/workflows/ci-image.yml"
+      - "scripts/ci/**"
 
 permissions:
   contents: read
@@ -58,21 +61,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Single source of truth for tool pins: [tools] in mise.toml.
-      # awk stops at the first matching line inside [tools]; -F'"' picks
-      # the first-quoted field (version for rust and zig).
+      # Single source of truth for tool pins + image tag: scripts/ci/
+      # derive-image.sh (the same path release.yml consumes; local-runnable:
+      # prints RUST_PIN/ZIG_PIN/CI_IMAGE and appends them to $GITHUB_ENV).
       - name: Derive image tag from mise.toml pins
-        run: |
-          set -euo pipefail
-          owner_lc="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          rust_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/rust[ =]/{print $2; exit}' mise.toml)"
-          zig_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/zig[ =]/{print $2; exit}' mise.toml)"
-          [ -n "$rust_pin" ] || { echo "error: could not parse rust pin from mise.toml" >&2; exit 1; }
-          [ -n "$zig_pin" ] || { echo "error: could not parse zig pin from mise.toml" >&2; exit 1; }
-          echo "owner=$owner_lc" >> "$GITHUB_ENV"
-          echo "rust_pin=$rust_pin" >> "$GITHUB_ENV"
-          echo "zig_pin=$zig_pin" >> "$GITHUB_ENV"
-          echo "image=ghcr.io/${owner_lc}/devcroft-ci:rust${rust_pin}-zig${zig_pin}" >> "$GITHUB_ENV"
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: bash scripts/ci/derive-image.sh
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
@@ -92,8 +87,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.image }}
-            ghcr.io/${{ env.owner }}/devcroft-ci:latest
+            ${{ env.CI_IMAGE }}
+            ghcr.io/${{ env.OWNER_LC }}/devcroft-ci:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -103,6 +98,6 @@ jobs:
       - name: Verify pushed image (zig version matches pin)
         run: |
           set -euo pipefail
-          got="$(docker run --rm "$image" zig version)"
-          [ "$got" = "$zig_pin" ] || { echo "error: pushed image zig version '$got' ≠ mise.toml pin '$zig_pin'" >&2; exit 1; }
-          echo "pushed image OK: $image (zig $got)"
+          got="$(docker run --rm "$CI_IMAGE" zig version)"
+          [ "$got" = "$ZIG_PIN" ] || { echo "error: pushed image zig version '$got' ≠ mise.toml pin '$ZIG_PIN'" >&2; exit 1; }
+          echo "pushed image OK: $CI_IMAGE (zig $got)"

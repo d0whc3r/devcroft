@@ -30,4 +30,3 @@
 *.orig
 *.rej
 *.bak
-.docker-cargo-home/

@@ -1,0 +1,8 @@
+# Dockerfile.ci COPY context for the deps-bake stage. Exclusions below keep
+# the build context lean; do NOT exclude Cargo.* or vendor-patches (cargo
+# needs them to resolve the locked graph).
+.git
+.github
+target
+.docker-cargo-home
+docs

@@ -58,9 +58,10 @@
 # - Linux build-system deps (clang, libclang-dev, cmake, ninja-build,
 #   pkg-config, libfontconfig1-dev, libfreetype-dev) now live inside the warm
 #   CI image (see Dockerfile.ci); the runner no longer runs apt at all.
-# - Build caches via actions/cache: target/ + .docker-cargo-home/ are
-#   restored/saved per matrix target (keyed on Cargo.lock content), so
-#   dependency compilation and registry downloads carry over between runs.
+# - Compiled dependencies live IN the image (/target-warm, Dockerfile.ci
+#   deps-bake stage): a release run only compiles devcroft and links; scripts
+#   live in scripts/ci/ (container-build.sh runs inside, derive-image.sh is
+#   shared with ci-image.yml).
 # - Asset names must stay exactly as install.sh's detect_platform expects:
 #   x86_64-unknown-linux-gnu → devcroft-linux-x86_64.tar.gz
 #   aarch64-apple-darwin → devcroft-darwin-arm64.tar.gz
@@ -165,12 +166,12 @@ jobs:
   # A uid mismatch would break writes into the mounted workspace and any
   # release run would fail loudly on the first cargo create() in target/.
   #
-  # WARMTH NOTE: the image's baked CARGO_HOME carries the registry index,
-  # .crate cache and the preinstalled cargo-zigbuild binary. Compilation of
-  # dependencies always lands in <workspace>/target/ (never CARGO_HOME), so a
-  # workspace target/ snapshot is intentionally NOT part of the image;
-  # caching target/ + .docker-cargo-home/ between runs IS implemented
-  # above (actions/cache, per-matrix-target keys).
+  # WARMTH NOTE: the image carries the compiled dependency graph in
+  # /target-warm (Dockerfile.ci deps-bake) built with the exact absolute
+  # paths and tool versions used at run time: CARGO_TARGET_DIR=/target-warm
+  # (the env is baked in the image), source tree at /workspace (the mount),
+  # rust/zig/zigbuild asserted by the image gate. The run-time build
+  # therefore only compiles devcroft and links.
   #
   # No GITHUB_* env vars are passed into the build: the mounted .git
   # checkout satisfies any git-derived version info, and cargo needs none.
@@ -191,42 +192,13 @@ jobs:
           fetch-tags: true
           ref: "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}"
 
-      # BUILD CACHES (two layers, per matrix target):
-      #   1. target/          — compiled dependency artifacts (the big one; a
-      #      warm restore skips recompiling ~600 crates, saving ~15 min/job)
-      #   2. .docker-cargo-home/ — CARGO_HOME for the container (registry
-      #      index + downloaded .crate files), so changing Cargo.lock only
-      #      downloads what's new, not the whole registry snapshot
-      # keys are Cargo.lock-content-hashed; restore-keys give partial reuse
-      # when only the package versions changed. cargo zigbuild fingerprints
-      # the CARGO_HOME path consistently (same mount each run), so restore
-      # doesn't thrash the build script cache.
-      - name: Restore build caches (target + cargo home)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ github.workspace }}/target
-            ${{ github.workspace }}/.docker-cargo-home
-          key: v1-build-${{ matrix.triple }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            v1-build-${{ matrix.triple }}-${{ runner.os }}-
-
-      # Derive the warm image tag from the SAME mise.toml pins ci-image.yml
-      # uses, so a release build always points at the tag matching this
-      # branch's tool versions (dots are legal in docker tags).
+      # Derive the warm image tag from mise.toml pins. The parsing lives in
+      # scripts/ci/derive-image.sh — the SAME script ci-image.yml uses to
+      # compose the tag it pushes, so bake/consumers cannot drift apart.
       - name: Derive warm image tag from mise.toml pins
         env:
           REPO_OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          owner_lc="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
-          rust_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/rust[ =]/{print $2; exit}' mise.toml)"
-          zig_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/zig[ =]/{print $2; exit}' mise.toml)"
-          [ -n "$rust_pin" ] || { echo "error: could not parse rust pin from mise.toml" >&2; exit 1; }
-          [ -n "$zig_pin" ] || { echo "error: could not parse zig pin from mise.toml" >&2; exit 1; }
-          echo "RUST_PIN=$rust_pin" >> "$GITHUB_ENV"
-          echo "ZIG_PIN=$zig_pin" >> "$GITHUB_ENV"
-          echo "CI_IMAGE=ghcr.io/${owner_lc}/devcroft-ci:rust${rust_pin}-zig${zig_pin}" >> "$GITHUB_ENV"
+        run: bash scripts/ci/derive-image.sh
 
       # Public GHCR image from a public repo: anonymous pull, free + fast.
       # Warm pull ~= the time the old apt+rustup+cargo-install steps took;
@@ -245,18 +217,19 @@ jobs:
           curl -fsSL https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz \
             | tar -Jx -C "$GITHUB_WORKSPACE"
 
-      # Build inside the warm image. Order within the container: pin-drift
-      # validation (hard fail on any mismatch), then the build, then
-      # diagnostics ALWAYS (the old `if: failure()` step folded in, so a
-      # failed build still prints which zig/zigbuild/SDKROOT were visible).
-      - name: Build release binary inside warm image (cargo zigbuild)
+      # Build inside the warm image: the whole inner script (pin validation,
+      # cargo zigbuild, diagnostics, binary copy-out) lives in
+      # scripts/ci/container-build.sh (testable with bash -n locally, no
+      # heredoc indentation traps). The workspace mount at /workspace makes
+      # the script reachable at its fixed path inside the container.
+      - name: Build release binary inside warm image (container-build.sh)
         env:
           TRIPLE: ${{ matrix.triple }}
           SDK_ENABLED: ${{ matrix.sdk }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           docker_args=(
-            --rm -i
+            --rm
             --user 1001:1001
             -v "$GITHUB_WORKSPACE:/workspace"
             --workdir /workspace
@@ -264,62 +237,12 @@ jobs:
             -e RUST_PIN="$RUST_PIN"
             -e ZIG_PIN="$ZIG_PIN"
             -e CARGO_ZIGBUILD_VERSION="$CARGO_ZIGBUILD_VERSION"
-            # CARGO_HOME lives on the (cached) workspace mount, not the
-            # image, so the registry snapshot persists between runs.
-            -e CARGO_HOME=/workspace/.docker-cargo-home
           )
           if [ "$SDK_ENABLED" = "true" ]; then
             docker_args+=( -e SDKROOT=/workspace/MacOSX11.3.sdk )
           fi
-          docker run "${docker_args[@]}" "$CI_IMAGE" bash -s <<'EOF'
-            set -u
-            status=0
-            echo "=== toolchain inspection ==="
-            echo "zig:     $(which zig)   $(zig version)"
-            echo "rustc:   $(which rustc)   $(rustc --version)"
-            echo "zigbuild: $(which cargo-zigbuild)   $(cargo-zigbuild --version)"
-            echo "SDKROOT: ${SDKROOT:-<unset>}"
-
-            echo "=== pin validation (mise.toml: rust=$RUST_PIN zig=$ZIG_PIN zigbuild=$CARGO_ZIGBUILD_VERSION) ==="
-            if ! zig version | grep -qx "$ZIG_PIN"; then
-              echo "::error::zig pin drift: expected $ZIG_PIN, got $(zig version)"; status=1
-            fi
-            if ! rustc --version | grep -qE "^rustc ${RUST_PIN} "; then
-              echo "::error::rustc pin drift: expected rustc $RUST_PIN, got $(rustc --version)"; status=1
-            fi
-            if ! cargo-zigbuild --version | grep -qE "^cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}[[:space:]]*$"; then
-              echo "::error::cargo-zigbuild pin drift: expected $CARGO_ZIGBUILD_VERSION, got $(cargo-zigbuild --version)"; status=1
-            fi
-            if ! rustup target list --installed | grep -qx "$TARGET"; then
-              echo "::error::rust target not installed in image: $TARGET"; status=1
-            fi
-            [ "$status" -eq 0 ] || exit "$status"
-
-            # Linux-gnu: zigbuild defaults to glibc 2.17 stubs, but the ubuntu-24.04
-            # system libs we link (libxkbcommon etc.) reference glibc >= 2.38
-            # symbols (e.g. __isoc23_strtoul@GLIBC_2.38) that 2.17 stubs lack.
-            # Pinning .2.38 defines those symbols in the linker stub map.
-            case "$TARGET" in
-              *-linux-gnu) ZIG_TARGET="$TARGET.2.38" ;;
-              *)           ZIG_TARGET="$TARGET" ;;
-            esac
-            echo "=== cargo zigbuild --release --locked --target $ZIG_TARGET ==="
-            cargo zigbuild --release --locked --target "$ZIG_TARGET"
-            status=$?
-            if [ "$status" -ne 0 ]; then
-              echo "::warning::cargo zigbuild failed (status=$status) — diagnostics follow"
-              echo "which zig  : $(which zig)"; zig version
-              echo "cargo-zigbuild: $(which cargo-zigbuild)   $(cargo-zigbuild --version)"
-              echo "SDKROOT: ${SDKROOT:-<unset>}"
-              exit "$status"
-            fi
-
-            echo "=== post-build diagnostics ==="
-            echo "zig version      : $(zig version)"
-            echo "cargo zigbuild   : $(cargo-zigbuild --version)"
-            echo "SDKROOT          : ${SDKROOT:-<unset>}"
-            echo "built binary     : $(ls -l "target/$TARGET/release/devcroft")"
-          EOF
+          docker run "${docker_args[@]}" "$CI_IMAGE" \
+            bash /workspace/scripts/ci/container-build.sh
 
       - name: Package asset
         run: |
@@ -348,16 +271,6 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
           retention-days: 3
-
-      # Trim before actions/cache's post-step saves target/: incremental
-      # dirs can waste hundreds of MB and never warm anything downstream
-      # (release profile anyway compiles minimal increments).
-      - name: Trim target/ before cache save
-        run: |
-          set -euo pipefail
-          du -sh target 2>/dev/null || true
-          find target -maxdepth 3 -type d -name incremental -exec rm -rf {} + || true
-          du -sh target .docker-cargo-home 2>/dev/null || true
 
   release:
     name: Publish GitHub Release
