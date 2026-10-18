@@ -1,7 +1,7 @@
 # Release pipeline for Devcroft.
 #
 # Triggered by `v*` tags and manual dispatch. Builds the release `devcroft`
-# binary for all four supported targets, packages each as a plain
+# binary for the two supported targets, packages each as a plain
 # devcroft-<os>-<arch>.tar.gz (containing only the `devcroft` binary), and
 # publishes one GitHub Release with all tarballs plus a single SHA256SUMS
 # file. The repo-root install.sh consumes exactly this layout.
@@ -18,13 +18,10 @@
 # core from Zig sources, and .cargo/config.toml sets LIBGHOSTTY_VT_SYS_OPTIMIZE
 # so it builds in ReleaseFast.
 #
-# Target matrix:
-#   - aarch64-unknown-linux-gnu  (cross via cargo-zigbuild; zig provides the
-#     C sysroot/libc headers — do NOT add a -glibc suffix to the triple)
+# Target matrix (only the two distributions the repo owner wants):
 #   - x86_64-unknown-linux-gnu   (native, but built with the same
 #     `cargo zigbuild` command for uniformity)
 #   - aarch64-apple-darwin       (cross via cargo-zigbuild + macOS SDK)
-#   - x86_64-apple-darwin        (cross via cargo-zigbuild + macOS SDK)
 #
 # APPLE-SDK GATEWAY: darwin targets need a macOS SDK. We pull the public
 # phracker/MacOSX-SDKs 11.3 tarball per run — it is never vendored/committed
@@ -54,13 +51,11 @@
 #   LLVM version here), plus cmake, ninja-build, pkg-config for the
 #   GPUI/wgpu stack.
 # - Asset names must stay exactly as install.sh's detect_platform expects:
-#   aarch64-apple-darwin → devcroft-darwin-arm64.tar.gz
-#   x86_64-apple-darwin  → devcroft-darwin-x86_64.tar.gz
-#   aarch64-unknown-linux-gnu → devcroft-linux-arm64.tar.gz
 #   x86_64-unknown-linux-gnu → devcroft-linux-x86_64.tar.gz
+#   aarch64-apple-darwin → devcroft-darwin-arm64.tar.gz
 # - On workflow_dispatch, the `targets` input optionally limits the matrix
-#   to a space-separated subset of triples (e.g. "aarch64-unknown-linux-gnu
-#   x86_64-unknown-linux-gnu"); a `filter` job reduces the matrix to JSON.
+#   to a space-separated subset of triples (e.g. "x86_64-unknown-linux-gnu
+#   aarch64-apple-darwin"); a `filter` job reduces the matrix to JSON.
 
 name: Release
 
@@ -80,7 +75,7 @@ on:
         type: boolean
         default: false
       targets:
-        description: "Optional space-separated subset of triples to build (default: all four)"
+        description: "Optional space-separated subset of triples to build (default: both targets)"
         required: false
         type: string
         default: ""
@@ -108,8 +103,6 @@ jobs:
         run: |
           full='[
             { "triple": "x86_64-unknown-linux-gnu",  "asset": "devcroft-linux-x86_64.tar.gz",  "sdk": false },
-            { "triple": "aarch64-unknown-linux-gnu", "asset": "devcroft-linux-arm64.tar.gz",   "sdk": false },
-            { "triple": "x86_64-apple-darwin",       "asset": "devcroft-darwin-x86_64.tar.gz", "sdk": true  },
             { "triple": "aarch64-apple-darwin",      "asset": "devcroft-darwin-arm64.tar.gz",  "sdk": true  }
           ]'
           set -euo pipefail
