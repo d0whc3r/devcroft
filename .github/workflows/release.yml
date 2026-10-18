@@ -1,0 +1,164 @@
+# Release pipeline for Devcroft.
+#
+# Triggered by `v*` tags and manual dispatch. Builds the release `devcroft`
+# binary for all four supported targets, packages each as a plain
+# devcroft-<os>-<arch>.tar.gz (containing only the `devcroft` binary), and
+# publishes one GitHub Release with all tarballs plus a single SHA256SUMS
+# file. The repo-root install.sh consumes exactly this layout.
+#
+# Toolchains are pinned in mise.toml and installed by mise — currently
+# rust 1.97.1 and zig 0.16.0. Zig is required at build time: the
+# libghostty-vt-sys dependency compiles its VT core from Zig sources, and
+# .cargo/config.toml sets LIBGHOSTTY_VT_SYS_OPTIMIZE so it builds in
+# ReleaseFast.
+#
+# NOTES / WARNINGS:
+# - The CLI and the GPUI desktop app are the same crate and binary, so each
+#   job builds the whole workspace; nothing app-only is packaged.
+# - darwin-x86_64 builds on the macos-13 runner (the last macOS x86_64
+#   host). When GitHub retires it, either drop that target or switch it to
+#   cross-compilation from an arm64 runner.
+# - Linux build-system deps: no apt packages beyond runner defaults are
+#   known to be needed today (Rust + Zig only). If a linux job ever fails
+#   on missing system headers from the GPUI/wgpu stack, add the exact apt
+#   packages in a step here — do NOT encode fallbacks in install.sh.
+# - The aarch64 Linux job is packaged as devcroft-linux-arm64.tar.gz to
+#   match install.sh's asset naming (aarch64 == arm64 there).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or ref to build and release (e.g. v0.2.1); empty builds the current branch"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a prerelease"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runs_on: macos-14
+            asset: devcroft-darwin-arm64.tar.gz
+          - os: darwin
+            arch: x86_64
+            runs_on: macos-13
+            asset: devcroft-darwin-x86_64.tar.gz
+          - os: linux
+            arch: x86_64
+            runs_on: ubuntu-24.04
+            asset: devcroft-linux-x86_64.tar.gz
+          - os: linux
+            arch: aarch64
+            runs_on: ubuntu-24.04-arm
+            asset: devcroft-linux-arm64.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so any tag-based versioning stays clean.
+          fetch-depth: 0
+          fetch-tags: true
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}"
+
+      - name: Install pinned toolchains via mise (mise.toml)
+        uses: jdx/mise-action@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package asset
+        run: |
+          asset="${{ matrix.asset }}"
+          tar -czf "$asset" -C target/release devcroft
+
+      - name: Checksum asset
+        run: |
+          asset="${{ matrix.asset }}"
+          # sha256sum from the worker's own checksum artifacts → SHA256SUMS lines
+          # must read "<sha256>  <asset-name>" to match what install.sh greps.
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          retention-days: 3
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Derive tag and prerelease flag
+        id: release_meta
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          DEFAULT_TAG: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_REF:-$DEFAULT_TAG}"
+          pre="$INPUT_PRERELEASE"
+          # Prerelease is explicit via dispatch, or inferred from a
+          # prerelease suffix in the tag itself (e.g. v0.2.1-rc1).
+          if [ "$pre" != "true" ]; then
+            case "$tag" in
+              *-*) pre="true" ;;
+              *) pre="false" ;;
+            esac
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+          echo "release meta: tag=$tag prerelease=$pre"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          cat dist/devcroft-*.tar.gz.sha256 > dist/SHA256SUMS
+          rm -f dist/devcroft-*.tar.gz.sha256
+          cat dist/SHA256SUMS
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: ${{ steps.release_meta.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/devcroft-*.tar.gz
+            dist/SHA256SUMS
