@@ -11,11 +11,20 @@
 # else). This replaces the old four-native-runner matrix (macos-14,
 # macos-13, ubuntu-24.04, ubuntu-24.04-arm).
 #
-# Toolchains are pinned in mise.toml (rust 1.97.1, zig 0.16.0) and installed
-# by mise. cargo-zigbuild itself is pinned here to 0.23.4 — the verified
-# combination is cargo-zigbuild 0.23.4 + rust 1.97.1 + zig 0.16.0. Zig is
-# required at build time: the libghostty-vt-sys dependency compiles its VT
-# core from Zig sources, and .cargo/config.toml sets LIBGHOSTTY_VT_SYS_OPTIMIZE
+# WARM-IMAGE TOOLCHAINS: the toolchain stack (apt build deps, rust 1.97.1 with
+# both rust targets preinstalled, zig 0.16.0, cargo-zigbuild 0.23.4) is baked
+# into a warm docker image built by .github/workflows/ci-image.yml and pushed
+# to ghcr.io/d0whc3r/devcroft-ci, tagged rust<r>-zig<z> derived from mise.toml
+# pins — the SAME pins release.yml checks at run time:
+#
+#   rust = 1.97.1 (mise.toml)  → RUST_PIN
+#   zig = 0.16.0 (mise.toml)   → ZIG_PIN (mise) / CARGO_ZIGBUILD_VERSION (here)
+#   cargo-zigbuild 0.23.4      → image default; verified combination is
+#                                cargo-zigbuild 0.23.4 + rust 1.97.1 + zig 0.16.0
+#
+# Verified combination is cargo-zigbuild 0.23.4 + rust 1.97.1 + zig 0.16.0.
+# Zig is required at build time: the libghostty-vt-sys dependency compiles its
+# VT core from Zig sources, and .cargo/config.toml sets LIBGHOSTTY_VT_SYS_OPTIMIZE
 # so it builds in ReleaseFast.
 #
 # Target matrix (only the two distributions the repo owner wants):
@@ -46,10 +55,12 @@
 # NOTES / WARNINGS:
 # - The CLI and the GPUI desktop app are the same crate and binary, so each
 #   job builds the whole workspace; nothing app-only is packaged.
-# - Linux build-system deps: clang + libclang-dev (bindgen/onig need a
-#   libclang 18+; ubuntu-24.04's default is recent enough — do not pin an
-#   LLVM version here), plus cmake, ninja-build, pkg-config for the
-#   GPUI/wgpu stack.
+# - Linux build-system deps (clang, libclang-dev, cmake, ninja-build,
+#   pkg-config, libfontconfig1-dev, libfreetype-dev) now live inside the warm
+#   CI image (see Dockerfile.ci); the runner no longer runs apt at all.
+# - FUTURE OPTIMIZATION (not implemented here): rust-cache / caching the
+#   workspace target/ between runs would shave further minutes; out of scope
+#   for the warm-image change.
 # - Asset names must stay exactly as install.sh's detect_platform expects:
 #   x86_64-unknown-linux-gnu → devcroft-linux-x86_64.tar.gz
 #   aarch64-apple-darwin → devcroft-darwin-arm64.tar.gz
@@ -122,6 +133,47 @@ jobs:
           # strategy.matrix consumes {"include": [...]}, not a bare array.
           echo "matrix=$(echo "$selected" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
 
+  # ------------------------------------------------------------------
+  # WARM-IMAGE BUILD FLOW (replaces per-run mise + rustup target + apt +
+  # cargo install cargo-zigbuild):
+  #
+  #   1. checkout (full history, unchanged)
+  #   2. parse the tool pins out of mise.toml → compose the image tag
+  #      ghcr.io/<owner>/devcroft-ci:rust<RUST_PIN>-zig<ZIG_PIN>
+  #      (the exact tag convention .github/workflows/ci-image.yml pushes)
+  #   3. darwin targets keep the per-run macOS SDK fetch — THE SDK STAYS
+  #      ON THE RUNNER WORKSPACE, outside docker; it is never baked into
+  #      the image (Apple forbids redistribution)
+  #   4. the build itself runs INSIDE the warm image via an explicit
+  #      `docker run --rm -v $GITHUB_WORKSPACE:/workspace ...` that
+  #      hard-fails first on any pin drift between image and mise.toml,
+  #      then runs `cargo zigbuild --release --locked --target <triple>`
+  #      with diagnostics always emitted after the build attempt
+  #   5. package/checksum/upload stay on the runner, unchanged
+  #
+  # WHY NO `container:` KEY on the job: the explicit docker run keeps
+  # workspace ownership and path semantics under our control (GitHub's
+  # `container:` wiring fights checkout/workspace ownership and adds
+  # docker-file ipc fiddling for registry auth).
+  #
+  # USER MAPPING (uid 1001): on GitHub-hosted ubuntu-24.04 runners the
+  # checkout lives under the runner user (uid 1001). The warm image's
+  # non-root `builder` user is created with uid/gid 1001 exactly so
+  # `--user 1001:1001` matches. cargo writes target/ INSIDE the mounted
+  # workspace; the owning directory is owned by runner uid 1001, and the
+  # container process is uid 1001 → it has owner write permission.
+  # A uid mismatch would break writes into the mounted workspace and any
+  # release run would fail loudly on the first cargo create() in target/.
+  #
+  # WARMTH NOTE: the image's baked CARGO_HOME carries the registry index,
+  # .crate cache and the preinstalled cargo-zigbuild binary. Compilation of
+  # dependencies always lands in <workspace>/target/ (never CARGO_HOME), so a
+  # workspace target/ snapshot is intentionally NOT part of the image;
+  # caching target/ between runs (rust-cache) is a separate future item.
+  #
+  # No GITHUB_* env vars are passed into the build: the mounted .git
+  # checkout satisfies any git-derived version info, and cargo needs none.
+  # ------------------------------------------------------------------
   build:
     name: build ${{ matrix.asset }} (${{ matrix.triple }})
     needs: filter
@@ -138,48 +190,104 @@ jobs:
           fetch-tags: true
           ref: "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}"
 
-      - name: "Install pinned toolchains via mise (mise.toml: rust 1.97.1, zig 0.16.0)"
-        uses: jdx/mise-action@v2
-
-      # mise's rust is rustup-backed, so this adds the needed std
-      # for cross targets (no-op for the already-installed native one).
-      - name: Add rust target (${{ matrix.triple }})
-        run: rustup target add ${{ matrix.triple }}
-
-      - name: Install build-system deps (apt)
+      # Derive the warm image tag from the SAME mise.toml pins ci-image.yml
+      # uses, so a release build always points at the tag matching this
+      # branch's tool versions (dots are legal in docker tags).
+      - name: Derive warm image tag from mise.toml pins
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          sudo apt-get update
-          # fontconfig/freetype: yeslogic-fontconfig-sys needs fontconfig.pc
-          # at build time (build.rs of the font stack).
-          sudo apt-get install -y clang libclang-dev cmake ninja-build \
-            pkg-config libfontconfig1-dev libfreetype-dev
+          set -euo pipefail
+          owner_lc="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          rust_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/rust[ =]/{print $2; exit}' mise.toml)"
+          zig_pin="$(awk -F'"' '/^\[tools\]/{t=1;next} t&&/zig[ =]/{print $2; exit}' mise.toml)"
+          [ -n "$rust_pin" ] || { echo "error: could not parse rust pin from mise.toml" >&2; exit 1; }
+          [ -n "$zig_pin" ] || { echo "error: could not parse zig pin from mise.toml" >&2; exit 1; }
+          echo "RUST_PIN=$rust_pin" >> "$GITHUB_ENV"
+          echo "ZIG_PIN=$zig_pin" >> "$GITHUB_ENV"
+          echo "CI_IMAGE=ghcr.io/${owner_lc}/devcroft-ci:rust${rust_pin}-zig${zig_pin}" >> "$GITHUB_ENV"
 
-      # Slow (~1 min) but pinned; lands in ~/.cargo/bin, which mise/rustup
-      # setups already have on PATH.
-      - name: Install cargo-zigbuild (${{ env.CARGO_ZIGBUILD_VERSION }})
-        run: cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+      # Public GHCR image from a public repo: anonymous pull, free + fast.
+      # Warm pull ~= the time the old apt+rustup+cargo-install steps took;
+      # cached builds re-pull deduped layers, often sub-30s.
+      - name: Pull warm CI image (${{ env.CI_IMAGE }})
+        run: docker pull "$CI_IMAGE"
 
-      # APPLE-SDK GATEWAY: fetched per run, never committed. See header
-      # comments for the licensing caveat.
+      # APPLE-SDK GATEWAY: fetched per run into the runner workspace, never
+      # committed and never baked into the image (licensing caveat in the
+      # file header). Passed into the container below as
+      # SDKROOT=/workspace/MacOSX11.3.sdk, the mount-side path.
       - name: Fetch macOS SDK (darwin targets only)
         if: matrix.sdk
         run: |
           set -euo pipefail
           curl -fsSL https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz \
-            | tar -Jx
-          echo "SDKROOT=$PWD/MacOSX11.3.sdk" >> "$GITHUB_ENV"
+            | tar -Jx -C "$GITHUB_WORKSPACE"
 
-      # cargo-zigbuild reads SDKROOT for zig >= 0.15 and wires the -F
-      # framework search path / .tbd stubs itself — do NOT set --sysroot.
-      - name: Build release binary (cargo zigbuild)
-        run: cargo zigbuild --release --locked --target ${{ matrix.triple }}
-
-      - name: Diagnostic (which zig / zig version / cargo-zigbuild) on failure
-        if: failure()
+      # Build inside the warm image. Order within the container: pin-drift
+      # validation (hard fail on any mismatch), then the build, then
+      # diagnostics ALWAYS (the old `if: failure()` step folded in, so a
+      # failed build still prints which zig/zigbuild/SDKROOT were visible).
+      - name: Build release binary inside warm image (cargo zigbuild)
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          SDK_ENABLED: ${{ matrix.sdk }}
         run: |
-          which zig; zig version
-          which cargo-zigbuild; cargo-zigbuild --version
-          echo "SDKROOT=${SDKROOT:-<unset>}"
+          set -uo pipefail
+          docker_args=(
+            --rm -i
+            --user 1001:1001
+            -v "$GITHUB_WORKSPACE:/workspace"
+            --workdir /workspace
+            -e TARGET="$TRIPLE"
+            -e RUST_PIN="$RUST_PIN"
+            -e ZIG_PIN="$ZIG_PIN"
+            -e CARGO_ZIGBUILD_VERSION="$CARGO_ZIGBUILD_VERSION"
+          )
+          if [ "$SDK_ENABLED" = "true" ]; then
+            docker_args+=( -e SDKROOT=/workspace/MacOSX11.3.sdk )
+          fi
+          docker run "${docker_args[@]}" "$CI_IMAGE" bash -s <<'EOF'
+            set -u
+            status=0
+            echo "=== toolchain inspection ==="
+            echo "zig:     $(which zig)   $(zig version)"
+            echo "rustc:   $(which rustc)   $(rustc --version)"
+            echo "zigbuild: $(which cargo-zigbuild)   $(cargo zigbuild --version)"
+            echo "SDKROOT: ${SDKROOT:-<unset>}"
+
+            echo "=== pin validation (mise.toml: rust=$RUST_PIN zig=$ZIG_PIN zigbuild=$CARGO_ZIGBUILD_VERSION) ==="
+            if ! zig version | grep -qx "$ZIG_PIN"; then
+              echo "::error::zig pin drift: expected $ZIG_PIN, got $(zig version)"; status=1
+            fi
+            if ! rustc --version | grep -qE "^rustc ${RUST_PIN} "; then
+              echo "::error::rustc pin drift: expected rustc $RUST_PIN, got $(rustc --version)"; status=1
+            fi
+            if ! cargo zigbuild --version | grep -qE "^cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}[[:space:]]*$"; then
+              echo "::error::cargo-zigbuild pin drift: expected $CARGO_ZIGBUILD_VERSION, got $(cargo zigbuild --version)"; status=1
+            fi
+            if ! rustup target list --installed | grep -qx "$TARGET"; then
+              echo "::error::rust target not installed in image: $TARGET"; status=1
+            fi
+            [ "$status" -eq 0 ] || exit "$status"
+
+            echo "=== cargo zigbuild --release --locked --target $TARGET ==="
+            cargo zigbuild --release --locked --target "$TARGET"
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::warning::cargo zigbuild failed (status=$status) — diagnostics follow"
+              echo "which zig  : $(which zig)"; zig version
+              echo "cargo-zigbuild: $(which cargo-zigbuild)   $(cargo zigbuild --version)"
+              echo "SDKROOT: ${SDKROOT:-<unset>}"
+              exit "$status"
+            fi
+
+            echo "=== post-build diagnostics ==="
+            echo "zig version      : $(zig version)"
+            echo "cargo zigbuild   : $(cargo zigbuild --version)"
+            echo "SDKROOT          : ${SDKROOT:-<unset>}"
+            echo "built binary     : $(ls -l "target/$TARGET/release/devcroft")"
+          EOF
 
       - name: Package asset
         run: |
