@@ -58,9 +58,9 @@
 # - Linux build-system deps (clang, libclang-dev, cmake, ninja-build,
 #   pkg-config, libfontconfig1-dev, libfreetype-dev) now live inside the warm
 #   CI image (see Dockerfile.ci); the runner no longer runs apt at all.
-# - FUTURE OPTIMIZATION (not implemented here): rust-cache / caching the
-#   workspace target/ between runs would shave further minutes; out of scope
-#   for the warm-image change.
+# - Build caches via actions/cache: target/ + .docker-cargo-home/ are
+#   restored/saved per matrix target (keyed on Cargo.lock content), so
+#   dependency compilation and registry downloads carry over between runs.
 # - Asset names must stay exactly as install.sh's detect_platform expects:
 #   x86_64-unknown-linux-gnu → devcroft-linux-x86_64.tar.gz
 #   aarch64-apple-darwin → devcroft-darwin-arm64.tar.gz
@@ -169,7 +169,8 @@ jobs:
   # .crate cache and the preinstalled cargo-zigbuild binary. Compilation of
   # dependencies always lands in <workspace>/target/ (never CARGO_HOME), so a
   # workspace target/ snapshot is intentionally NOT part of the image;
-  # caching target/ between runs (rust-cache) is a separate future item.
+  # caching target/ + .docker-cargo-home/ between runs IS implemented
+  # above (actions/cache, per-matrix-target keys).
   #
   # No GITHUB_* env vars are passed into the build: the mounted .git
   # checkout satisfies any git-derived version info, and cargo needs none.
@@ -189,6 +190,26 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           ref: "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}"
+
+      # BUILD CACHES (two layers, per matrix target):
+      #   1. target/          — compiled dependency artifacts (the big one; a
+      #      warm restore skips recompiling ~600 crates, saving ~15 min/job)
+      #   2. .docker-cargo-home/ — CARGO_HOME for the container (registry
+      #      index + downloaded .crate files), so changing Cargo.lock only
+      #      downloads what's new, not the whole registry snapshot
+      # keys are Cargo.lock-content-hashed; restore-keys give partial reuse
+      # when only the package versions changed. cargo zigbuild fingerprints
+      # the CARGO_HOME path consistently (same mount each run), so restore
+      # doesn't thrash the build script cache.
+      - name: Restore build caches (target + cargo home)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.docker-cargo-home
+          key: v1-build-${{ matrix.triple }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            v1-build-${{ matrix.triple }}-${{ runner.os }}-
 
       # Derive the warm image tag from the SAME mise.toml pins ci-image.yml
       # uses, so a release build always points at the tag matching this
@@ -243,6 +264,9 @@ jobs:
             -e RUST_PIN="$RUST_PIN"
             -e ZIG_PIN="$ZIG_PIN"
             -e CARGO_ZIGBUILD_VERSION="$CARGO_ZIGBUILD_VERSION"
+            # CARGO_HOME lives on the (cached) workspace mount, not the
+            # image, so the registry snapshot persists between runs.
+            -e CARGO_HOME=/workspace/.docker-cargo-home
           )
           if [ "$SDK_ENABLED" = "true" ]; then
             docker_args+=( -e SDKROOT=/workspace/MacOSX11.3.sdk )
@@ -324,6 +348,16 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
           retention-days: 3
+
+      # Trim before actions/cache's post-step saves target/: incremental
+      # dirs can waste hundreds of MB and never warm anything downstream
+      # (release profile anyway compiles minimal increments).
+      - name: Trim target/ before cache save
+        run: |
+          set -euo pipefail
+          du -sh target 2>/dev/null || true
+          find target -maxdepth 3 -type d -name incremental -exec rm -rf {} + || true
+          du -sh target .docker-cargo-home 2>/dev/null || true
 
   release:
     name: Publish GitHub Release
