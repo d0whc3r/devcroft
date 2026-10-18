@@ -4,11 +4,19 @@
 
 Devcroft is a GPUI based desktop app for personal development workflow. It focuses on keeping development workflow same no matter which harness you use. Vim like keyboard navigation let you fly between projects with ease.
 
-> Status: pre-release (0.1.0). Build from source; there are no packaged binaries yet because the release pipeline is still coming.
+> Status: pre-release (0.1.0). Tagged releases ship checksum-verified prebuilt binaries — see below — and building from source works too.
 
 ## Quickstart
 
-Requirements: [mise](https://mise.jdx.dev/) (manages the pinned Rust and Zig toolchains) Git (`git` on the application PATH), and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
+### One-command install (no clone needed)
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/d0whc3r/devcroft/main/install.sh)"
+```
+
+This downloads a checksum-verified prebuilt binary of the latest release and installs it as `~/.local/bin/devcroft` — no compilation, no toolchains, no repo. Every download is verified against the release's `SHA256SUMS` before anything is installed.
+
+Overrides: set `DEVCROFT_VERSION` to pin a version instead of `latest` (e.g. `DEVCROFT_VERSION=v0.2.1 bash -c "$(curl -fsSL ...)"`), and `DEVCROFT_INSTALL_DIR` to change the install location.
 
 ```sh
 mise install
