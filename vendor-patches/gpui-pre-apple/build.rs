@@ -13,7 +13,11 @@ fn main() {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+// Build scripts are compiled for the HOST, so this module must not be
+// gated behind `cfg!(target_os)`: on a Linux host cross-building darwin
+// the cfg would delete the module entirely and main() would fail to
+// resolve `apple_build`. The runtime gate lives in main(), which uses
+// CARGO_CFG_TARGET_OS, and the module itself is pure Rust.
 mod apple_build {
     use std::{
         env,

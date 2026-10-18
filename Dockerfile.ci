@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1
+#
+# Warm CI base image for Devcroft release builds (ghcr.io/d0whc3r/devcroft-ci).
+#
+# Purpose: cut the per-run toolchain warm-up cost of .github/workflows/release.yml
+# (apt packages + rustup target add + `cargo install cargo-zigbuild` ≈ 2-3 min per
+# matrix job) by baking all of it into one linux/amd64 image on ghcr.io.
+#
+# SINGLE IMAGE, TWO TARGETS: zig does the cross-compilation entirely from
+# linux/amd64, so there are no per-arch images — the native
+# x86_64-unknown-linux-gnu build and the aarch64-apple-darwin cross build both
+# run in this image via `cargo zigbuild`.
+#
+# PIN DISCIPLINE: pins below must match mise.toml (rust 1.97.1, zig 0.16.0) and
+# release.yml's CARGO_ZIGBUILD_VERSION (0.23.4). Drift cannot be silent: the
+# final layer asserts the exact version strings and fails the build on any
+# mismatch, and release.yml re-validates the pinned versions against the
+# mise.toml-derived expectations inside the container on every run.
+#
+# NEVER bake the macOS SDK into this image — it is Apple-proprietary and must
+# not be vendored or redistributed. The SDK is fetched per run, outside docker,
+# and passed into the container as SDKROOT (see release.yml).
+#
+# NO secrets or credentials are baked; the image pulls/pushes are unauthenticated
+# on the public repo except for the GHCR push token in ci-image.yml.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps = the same set the old release.yml "Install build-system deps"
+# step installed (clang, libclang-dev, cmake, ninja-build, pkg-config,
+# libfontconfig1-dev, libfreetype-dev) plus the base utilities the runner image
+# used to provide implicitly (git, curl, unzip, xz-utils, tzdata,
+# ca-certificates, file) and build-essential (gcc is required for cargo's
+# default Linux builds; the runner image shipped it at no extra step cost).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        libclang-dev \
+        cmake \
+        ninja-build \
+        pkg-config \
+        git \
+        curl \
+        unzip \
+        xz-utils \
+        tzdata \
+        ca-certificates \
+        file \
+        libfontconfig1-dev \
+        libfreetype-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxcb1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Rust 1.97.1 (mise.toml: rust = 1.97.1), rustup-backed, minimal profile.
+# Both build targets are preinstalled so the matrix jobs never run
+# `rustup target add` (std download would otherwise be per-run work).
+# ---------------------------------------------------------------------------
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+
+RUN curl -fsSL https://sh.rustup.rs \
+        | RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}" \
+            sh -s -- -y --default-toolchain 1.97.1 --profile minimal --no-modify-path \
+    && rustup target add x86_64-unknown-linux-gnu aarch64-apple-darwin
+
+# ---------------------------------------------------------------------------
+# Zig 0.16.0 (mise.toml: zig = 0.16.0). Plain released tarball from ziglang.org
+# (checksummed below) instead of the mise toolchain manager, to keep the
+# container's dependencies minimal and deterministic. Tarball URL + sha256 are
+# copied from the official https://ziglang.org/download/index.json entry for
+# 0.16.0 / x86_64-linux.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    zig_url="https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"; \
+    zig_sha="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"; \
+    curl -fsSL "${zig_url}" -o /tmp/zig.tar.xz; \
+    echo "${zig_sha}  /tmp/zig.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/zig; \
+    tar -xJ --strip-components=1 -f /tmp/zig.tar.xz -C /opt/zig; \
+    rm -f /tmp/zig.tar.xz; \
+    ln -s /opt/zig/zig /usr/local/bin/zig; \
+    zig version
+
+# cargo-zigbuild pinned exactly (release.yml: CARGO_ZIGBUILD_VERSION 0.23.4).
+# Keep the layer small: drop the extracted registry sources (the .crate cache
+# and index stay, so workspace builds re-extract locally, offline-capable).
+RUN cargo install --locked --version 0.23.4 cargo-zigbuild \
+    && rm -rf "${CARGO_HOME}/registry/src"
+
+# ---------------------------------------------------------------------------
+# Non-root builder: uid/gid 1001 deliberately matches the default user (uid
+# 1001) on GitHub-hosted ubuntu-24.04 runners, so a run-time bind mount of the
+# checkout can be built in-place by the container user (see release.yml).
+# HOME is set explicitly because `docker run --user` overrides USER without
+# re-deriving the environment.
+# ---------------------------------------------------------------------------
+ENV HOME=/home/builder \
+    ZIG_GLOBAL_CACHE_DIR=/home/builder/.cache/zig
+
+RUN useradd --create-home --uid 1001 --user-group --shell /bin/bash builder \
+    && mkdir -p /workspace \
+    && chown -R builder:builder "${CARGO_HOME}" "${RUSTUP_HOME}" /home/builder /workspace
+
+USER builder
+WORKDIR /workspace
+
+# NOTE ON WARMTH: the baked CARGO_HOME holds the registry index + .crate cache
+# plus the preinstalled cargo-zigbuild binary. Workspace dependency compilation
+# always lands in <workspace>/target/ (not CARGO_HOME), so per-run compile time
+# is unaffected by this image except via warmed index metadata — workspace
+# target/ snapshots are intentionally NOT baked.
+LABEL org.opencontainers.image.source=https://github.com/d0whc3r/devcroft \
+      org.opencontainers.image.description="Warm CI build image for Devcroft: rust 1.97.1 (native x86_64-unknown-linux-gnu + aarch64-apple-darwin std), zig 0.16.0, cargo-zigbuild 0.23.4 on ubuntu 24.04" \
+      org.opencontainers.image.licenses=MIT
+
+# Final-layer gate: fail the image build on any pin drift. Docker treats a
+# nonzero exit from RUN as a build failure. Strings asserted exactly:
+#   rustc 1.97.1 / zig 0.16.0 / cargo-zigbuild 0.23.4 / both rust targets.
+RUN set -eux; \
+    rustc --version | grep -q "^rustc 1.97.1 "; \
+    zig version | grep -qx "0.16.0"; \
+    cargo zigbuild --version | grep -q "^cargo-zigbuild 0.23.4$"; \
+    rustup target list --installed | grep -qx "aarch64-apple-darwin"; \
+    rustup target list --installed | grep -qx "x86_64-unknown-linux-gnu"; \
+    echo "ci image toolchain OK: rust 1.97.1 / zig 0.16.0 / cargo-zigbuild 0.23.4"
