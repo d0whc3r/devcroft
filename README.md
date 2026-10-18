@@ -8,6 +8,14 @@ Devcroft is a GPUI based desktop app for personal development workflow. It focus
 
 ## Quickstart
 
+### One-command install (no clone needed)
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/d0whc3r/devcroft/main/install.sh)"
+```
+
+This downloads the source tarball (no git clone), installs pinned toolchains via mise (auto-installs mise), builds, and installs the desktop app exactly like `mise run install` does below. It reaches the same end state as the Quickstart; it just doesn't need the repo on disk.
+
 Requirements: [mise](https://mise.jdx.dev/) (manages the pinned Rust and Zig toolchains) Git (`git` on the application PATH), and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
 
 ```sh
