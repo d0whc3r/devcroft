@@ -253,7 +253,7 @@ jobs:
             echo "=== toolchain inspection ==="
             echo "zig:     $(which zig)   $(zig version)"
             echo "rustc:   $(which rustc)   $(rustc --version)"
-            echo "zigbuild: $(which cargo-zigbuild)   $(cargo zigbuild --version)"
+            echo "zigbuild: $(which cargo-zigbuild)   $(cargo-zigbuild --version)"
             echo "SDKROOT: ${SDKROOT:-<unset>}"
 
             echo "=== pin validation (mise.toml: rust=$RUST_PIN zig=$ZIG_PIN zigbuild=$CARGO_ZIGBUILD_VERSION) ==="
@@ -263,8 +263,8 @@ jobs:
             if ! rustc --version | grep -qE "^rustc ${RUST_PIN} "; then
               echo "::error::rustc pin drift: expected rustc $RUST_PIN, got $(rustc --version)"; status=1
             fi
-            if ! cargo zigbuild --version | grep -qE "^cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}[[:space:]]*$"; then
-              echo "::error::cargo-zigbuild pin drift: expected $CARGO_ZIGBUILD_VERSION, got $(cargo zigbuild --version)"; status=1
+            if ! cargo-zigbuild --version | grep -qE "^cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}[[:space:]]*$"; then
+              echo "::error::cargo-zigbuild pin drift: expected $CARGO_ZIGBUILD_VERSION, got $(cargo-zigbuild --version)"; status=1
             fi
             if ! rustup target list --installed | grep -qx "$TARGET"; then
               echo "::error::rust target not installed in image: $TARGET"; status=1
@@ -277,14 +277,14 @@ jobs:
             if [ "$status" -ne 0 ]; then
               echo "::warning::cargo zigbuild failed (status=$status) — diagnostics follow"
               echo "which zig  : $(which zig)"; zig version
-              echo "cargo-zigbuild: $(which cargo-zigbuild)   $(cargo zigbuild --version)"
+              echo "cargo-zigbuild: $(which cargo-zigbuild)   $(cargo-zigbuild --version)"
               echo "SDKROOT: ${SDKROOT:-<unset>}"
               exit "$status"
             fi
 
             echo "=== post-build diagnostics ==="
             echo "zig version      : $(zig version)"
-            echo "cargo zigbuild   : $(cargo zigbuild --version)"
+            echo "cargo zigbuild   : $(cargo-zigbuild --version)"
             echo "SDKROOT          : ${SDKROOT:-<unset>}"
             echo "built binary     : $(ls -l "target/$TARGET/release/devcroft")"
           EOF
