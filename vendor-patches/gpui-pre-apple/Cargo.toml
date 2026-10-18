@@ -262,7 +262,10 @@ features = [
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.thiserror]
 version = "2.0.12"
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.build-dependencies.cbindgen]
+# Un-gated build-dependency: the build script compiles for the HOST
+# (even when cross-building), so target_os cfg here would drop cbindgen
+# on non-mac hosts and break the darwin cross-build's patched build.rs.
+[build-dependencies.cbindgen]
 version = "0.28.0"
 default-features = false
 

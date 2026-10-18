@@ -271,8 +271,16 @@ jobs:
             fi
             [ "$status" -eq 0 ] || exit "$status"
 
-            echo "=== cargo zigbuild --release --locked --target $TARGET ==="
-            cargo zigbuild --release --locked --target "$TARGET"
+            # Linux-gnu: zigbuild defaults to glibc 2.17 stubs, but the ubuntu-24.04
+            # system libs we link (libxkbcommon etc.) reference glibc >= 2.38
+            # symbols (e.g. __isoc23_strtoul@GLIBC_2.38) that 2.17 stubs lack.
+            # Pinning .2.38 defines those symbols in the linker stub map.
+            case "$TARGET" in
+              *-linux-gnu) ZIG_TARGET="$TARGET.2.38" ;;
+              *)           ZIG_TARGET="$TARGET" ;;
+            esac
+            echo "=== cargo zigbuild --release --locked --target $ZIG_TARGET ==="
+            cargo zigbuild --release --locked --target "$ZIG_TARGET"
             status=$?
             if [ "$status" -ne 0 ]; then
               echo "::warning::cargo zigbuild failed (status=$status) — diagnostics follow"
